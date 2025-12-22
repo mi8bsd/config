@@ -1,0 +1,219 @@
+#!/bin/sh
+#
+# $FreeBSD$
+
+# PROVIDE: portacl
+# REQUIRE: FILESYSTEMS
+# BEFORE: SERVERS
+# KEYWORD: nojail
+
+. /etc/rc.subr
+
+name="portacl"
+desc="Network port access control policy"
+rcvar="portacl_enable"
+extra_commands="printrules"
+start_precmd="portacl_check_sysctl_conf"
+start_cmd="portacl_start"
+stop_cmd="portacl_stop"
+printrules_cmd="portacl_printrules"
+required_modules="mac_portacl"
+
+: "${portacl_enable:="NO"}"
+: "${portacl_port_high:="1023"}"
+: "${portacl_suser_exempt:="YES"}"
+: "${portacl_autoport_exempt:="YES"}"
+: "${portacl_users:=""}"
+: "${portacl_groups:=""}"
+: "${portacl_additional_rules:=""}"
+
+is_integer()
+{
+	case "${1}" in
+	''|*[!0-9]*)
+		return 1
+		;;
+	esac
+}
+
+# Split the argument on commas
+split_comma()
+{
+	local rule
+	local IFS=','
+	for rule in $1
+	do
+		echo "${rule}"
+	done
+}
+
+# Lookup port in /etc/services if it is not numeric
+resolve_port()
+{
+	local lookup
+	local port="$1"
+	local proto="$2"
+
+	if is_integer "${port}"; then
+		echo "${port}"
+		return 0
+	fi
+
+	lookup=$(getent services "${port}/${proto}" | cut -w -f 2)
+	lookup="${lookup%%/*}"
+
+	if [ -z "${lookup}" ]; then
+		warn "unknown service ${port}"
+		return 1
+	fi
+
+	echo "${lookup}"
+}
+
+list_rules_for()
+{
+	local id ident ident_list port port_list proto
+	local kind="$1"
+	local key="uid"
+	local idflag="-u"
+
+	if [ "${kind}" = "group" ]; then
+		key="gid"
+		idflag="-g"
+	fi
+
+	eval ident_list="\${${name}_${kind}s}"
+	for ident in ${ident_list}
+	do
+		id=$(${ID} "${idflag}" "${ident}" 2>/dev/null)
+		if [ -z "${id}" ]; then
+			warn "unknown ${kind} ${ident}"
+			continue
+		fi
+
+		for proto in tcp udp
+		do
+			eval port_list="\${${name}_${kind}_${ident}_${proto}}"
+			for port in ${port_list}
+			do
+				port=$(resolve_port "${port}" "${proto}")
+				[ -z "${port}" ] && continue
+				echo "${key}:${id}:${proto}:${port}"
+			done
+		done
+	done
+}
+
+# list all rules, one per line
+list_rules()
+{
+	list_rules_for user
+	list_rules_for group
+	[ -n "${portacl_additional_rules}" ] && split_comma "${portacl_additional_rules}"
+}
+
+# generate a complete, validated ruleset ready for mac_portacl
+generate_rules()
+{
+	list_rules | sort -ut : | tr '\n' , | validate_rules
+}
+
+# Filter out invalid rules and warn on stderr
+validate_rules()
+{
+	awk '
+		BEGIN { RS = ","; FS = ":"; sep = ""; len = -1; ret = 0 }
+		{
+			newlen = len + length($0) + 1
+			if (newlen > 1023) {
+				print "WARNING: reached portacl rule limit of 1023 bytes" > "/dev/stderr"
+				exit 1
+			}
+			if (NF == 4 &&
+			    ($1 ~ /^(uid|gid)$/) &&
+			    ($2 ~ /^[0-9]+$/ && $2 >= 0 && $2 <= 65535) &&
+			    ($3 ~ /^(tcp|udp)$/) &&
+			    ($4 ~ /^[0-9]+$/ && $4 >= 0 && $4 <= 65535)) 
+			{
+				printf("%s%s", sep, $0)
+				sep = ","
+				len = newlen
+			} else {
+				print "WARNING: Invalid portacl rule:", $0 > "/dev/stderr"
+				ret = 1
+			}
+		}
+		END {
+			exit ret
+		}
+	'
+}
+
+portacl_printrules()
+{
+	generate_rules
+	echo
+}
+
+portacl_check_sysctl_conf()
+{
+	local f overrides oid
+
+	for f in /etc/sysctl.conf /etc/sysctl.conf.local
+	do
+		[ -r "${f}" ] || continue
+
+		overrides="$(awk '
+			$1 ~ /^(security\.mac\.portacl\.|net\.inet\.ip\.portrange\.reserved)/ {
+				gsub(/=.*/, "", $1)
+				print $1
+			}
+		' "${f}")"
+
+		for oid in $overrides
+		do
+			warn "overriding ${oid} in ${f}"
+		done
+	done
+}
+
+portacl_start()
+{
+	local rules
+	local port_high=1023
+	local suser_exempt=1
+	local autoport_exempt=1
+
+	if ! rules="$(generate_rules)"; then
+		warn "errors in ruleset skipped"
+	fi
+
+	if is_integer "${portacl_port_high}"; then
+		port_high="${portacl_port_high}"
+	else
+		warn "\$portacl_port_high is not set properly - see rc.conf(5)"
+	fi
+
+	checkyesno portacl_suser_exempt || suser_exempt=0
+	checkyesno portacl_autoport_exempt || autoport_exempt=0
+
+	check_startmsgs && echo "Configuring MAC portacl policy."
+	${SYSCTL} security.mac.portacl.rules="${rules}" >/dev/null &&
+	${SYSCTL} security.mac.portacl.suser_exempt="${suser_exempt}" >/dev/null &&
+	${SYSCTL} security.mac.portacl.autoport_exempt="${autoport_exempt}" >/dev/null &&
+	${SYSCTL} security.mac.portacl.port_high="${port_high}" >/dev/null &&
+	${SYSCTL} security.mac.portacl.enabled=1 >/dev/null &&
+	${SYSCTL} net.inet.ip.portrange.reservedlow=0 >/dev/null &&
+	${SYSCTL} net.inet.ip.portrange.reservedhigh=0 >/dev/null
+}
+
+portacl_stop()
+{
+	check_startmsgs && echo "Disabling MAC portacl policy."
+	${SYSCTL} net.inet.ip.portrange.reservedlow=0 >/dev/null &&
+	${SYSCTL} net.inet.ip.portrange.reservedhigh=1023 >/dev/null &&
+	${SYSCTL} security.mac.portacl.enabled=0 >/dev/null
+}
+
+load_rc_config $name
+run_rc_command "$1"
